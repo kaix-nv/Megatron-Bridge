@@ -30,9 +30,12 @@ from megatron.bridge.models.conversion.param_mapping import (
     FusedExpertMapping,
     FusedGatedExpertMapping,
     GatedMLPMapping,
+    GDNLinearMappingSeparate,
     QKVMapping,
     ReplicatedMapping,
     RowParallelMapping,
+    _split_gdn_grouped_to_separate,
+    split_gdn_linear_weights,
     split_qkv_weights,
 )
 from megatron.bridge.models.conversion.quant_mapping import AmaxMapping
@@ -57,6 +60,7 @@ class _SourceState:
     parallelism: str | None = None
     qkv_layout: tuple[int, int, int, int, bool] | None = None
     weight_dtype: torch.dtype | None = None
+    gdn_layout: tuple[int, int, int, int] | None = None
 
 
 def _same_storage(left: object, right: object) -> bool:
@@ -86,6 +90,8 @@ def _mapping_parallelism(mapping: Any, module: torch.nn.Module) -> str:
         raise NotImplementedError("ModelOpt real-quant export does not yet support grouped HF expert weights")
     if isinstance(mapping, GatedMLPMapping):
         return "gated"
+    if isinstance(mapping, GDNLinearMappingSeparate):
+        return mapping._tp_mapping._detect_parallelism_type(module)
     if isinstance(mapping, QKVMapping):
         return mapping._tp_mapping._detect_parallelism_type(module)
     if isinstance(mapping, AutoMapping):
@@ -110,6 +116,40 @@ def _qkv_layout(mapping: Any, module: torch.nn.Module) -> tuple[int, int, int, i
         int(config.hidden_size),
         bool(getattr(config, "attention_output_gate", False)),
     )
+
+
+def _gdn_layout(mapping: Any, module: torch.nn.Module) -> tuple[int, int, int, int] | None:
+    if not isinstance(mapping, GDNLinearMappingSeparate):
+        return None
+    config = mapping._get_config(module)
+    return (
+        int(config.linear_key_head_dim),
+        int(config.linear_value_head_dim),
+        int(config.linear_num_key_heads),
+        int(config.linear_num_value_heads),
+    )
+
+
+def _gdn_row_indices(layout: tuple[int, int, int, int], rows: int, tp_size: int) -> dict[str, torch.Tensor]:
+    """Rows of the gathered Megatron GatedDeltaNet ``in_proj`` that form HF's qkv / z / b / a.
+
+    Runs the BF16 export's own split (TP-interleaved layout -> head-grouped -> flat components) on
+    row indices, so the quantized export reorders packed rows exactly as the BF16 path reorders
+    weights. NVFP4 and FP8 scales are per output row or per tensor, so selecting rows keeps
+    them valid.
+    """
+    qk_head_dim, v_head_dim, num_qk_heads, num_v_heads = layout
+    config = SimpleNamespace(
+        hidden_size=1,
+        linear_key_head_dim=qk_head_dim,
+        linear_value_head_dim=v_head_dim,
+        linear_num_key_heads=num_qk_heads,
+        linear_num_value_heads=num_v_heads,
+    )
+    rows_as_weight = torch.arange(rows, dtype=torch.float64).unsqueeze(1)
+    qkvz, ba = split_gdn_linear_weights(config, rows_as_weight, tp_size=tp_size, feature_dim=1)
+    parts = _split_gdn_grouped_to_separate(config, qkvz, ba, feature_dim=1)
+    return {name: part.squeeze(1).long() for name, part in zip(("qkv", "z", "b", "a"), parts, strict=True)}
 
 
 def _validate_quantized_task(task: WeightConversionTask) -> None:
@@ -148,6 +188,7 @@ def _capture_source_state(task: WeightConversionTask) -> _SourceState | None:
         _mapping_parallelism(task.mapping, task.megatron_module),
         _qkv_layout(task.mapping, task.megatron_module),
         task.param_weight.dtype,
+        _gdn_layout(task.mapping, task.megatron_module),
     )
 
 
@@ -172,6 +213,7 @@ def _capture_source_spec(task: WeightConversionTask) -> _SourceState | None:
         _mapping_parallelism(task.mapping, task.megatron_module) if spec is not None else None,
         _qkv_layout(task.mapping, task.megatron_module) if spec is not None else None,
         task.param_weight.dtype,
+        _gdn_layout(task.mapping, task.megatron_module) if spec is not None else None,
     )
 
 
@@ -387,6 +429,11 @@ def _transform_source_state(
                 names["k"]: _select_state(transformed_state, 0, k_indices),
                 names["v"]: _select_state(transformed_state, 0, v_indices),
             }
+        elif isinstance(task.mapping, GDNLinearMappingSeparate):
+            if source.gdn_layout is None or parallelism != "column":
+                raise RuntimeError(f"Missing column-parallel GatedDeltaNet layout for {task.global_param_name}")
+            indices = _gdn_row_indices(source.gdn_layout, full_shape[0], len(shards))
+            transformed = {names[part]: _select_state(transformed_state, 0, rows) for part, rows in indices.items()}
         else:
             if len(names) != 1:
                 raise ValueError(f"Expected one HF name for {task.global_param_name}")
